@@ -7,6 +7,7 @@ datas = [
 hiddenimports = [
     "pythoncom",
     "pywintypes",
+    "pyodbc",
     "win32api",
     "win32print",
     "win32timezone",

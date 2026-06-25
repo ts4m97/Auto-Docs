@@ -32,6 +32,22 @@ class ExportHistoryRecord:
     created_at: str
 
 
+@dataclass
+class CustomerRecord:
+    cccd: str
+    fields: dict[str, str]
+    created_at: str
+    updated_at: str
+
+    @property
+    def display_name(self) -> str:
+        for key in ("ten_khach_hang", "ho_ten", "name", "customer_name", "client_name"):
+            value = self.fields.get(key)
+            if value:
+                return value
+        return self.cccd
+
+
 class TemplateStore:
     def __init__(self, data_dir: str | Path):
         self.data_dir = Path(data_dir)
@@ -87,6 +103,40 @@ class TemplateStore:
                 """
                 CREATE INDEX IF NOT EXISTS idx_export_history_template_created
                 ON export_history(template_id, created_at DESC)
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS customers (
+                    cccd TEXT PRIMARY KEY,
+                    fields_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_customers_updated
+                ON customers(updated_at DESC)
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS field_aliases (
+                    canonical TEXT NOT NULL,
+                    alias TEXT NOT NULL,
+                    PRIMARY KEY (canonical, alias)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS app_settings (
+                    key TEXT PRIMARY KEY,
+                    value_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
                 """
             )
 
@@ -232,6 +282,133 @@ class TemplateStore:
             else:
                 connection.execute("DELETE FROM export_history")
 
+    def upsert_customer(self, cccd: str, fields: dict[str, object]) -> CustomerRecord:
+        cccd = cccd.strip()
+        if not cccd:
+            raise ValueError("CCCD khong duoc de trong.")
+
+        clean_fields = {
+            str(key).strip(): "" if value is None else str(value).strip()
+            for key, value in fields.items()
+            if str(key).strip()
+        }
+        clean_fields["cccd"] = cccd
+        now = datetime.now().isoformat(timespec="seconds")
+        existing = self.get_customer(cccd)
+        created_at = existing.created_at if existing else now
+
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO customers (cccd, fields_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(cccd) DO UPDATE SET
+                    fields_json = excluded.fields_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    cccd,
+                    json.dumps(clean_fields, ensure_ascii=False),
+                    created_at,
+                    now,
+                ),
+            )
+        return CustomerRecord(cccd=cccd, fields=clean_fields, created_at=created_at, updated_at=now)
+
+    def get_customer(self, cccd: str) -> CustomerRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT cccd, fields_json, created_at, updated_at
+                FROM customers
+                WHERE cccd = ?
+                """,
+                (cccd,),
+            ).fetchone()
+        return self._customer_row_to_record(row) if row else None
+
+    def list_customers(self, query: str = "") -> list[CustomerRecord]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT cccd, fields_json, created_at, updated_at
+                FROM customers
+                ORDER BY updated_at DESC
+                """
+            ).fetchall()
+        records = [self._customer_row_to_record(row) for row in rows]
+        query = query.strip().casefold()
+        if not query:
+            return records
+        return [
+            record
+            for record in records
+            if query in record.cccd.casefold()
+            or query in record.display_name.casefold()
+            or query in " ".join(record.fields.values()).casefold()
+        ]
+
+    def delete_customer(self, cccd: str) -> None:
+        with self._connect() as connection:
+            connection.execute("DELETE FROM customers WHERE cccd = ?", (cccd,))
+
+    def list_field_aliases(self) -> dict[str, list[str]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT canonical, alias
+                FROM field_aliases
+                ORDER BY canonical COLLATE NOCASE, alias COLLATE NOCASE
+                """
+            ).fetchall()
+        aliases: dict[str, list[str]] = {}
+        for canonical, alias in rows:
+            aliases.setdefault(canonical, []).append(alias)
+        return aliases
+
+    def add_field_alias(self, canonical: str, alias: str) -> None:
+        canonical = canonical.strip()
+        alias = alias.strip()
+        if not canonical or not alias:
+            raise ValueError("Truong chuan va alias khong duoc de trong.")
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO field_aliases (canonical, alias)
+                VALUES (?, ?)
+                """,
+                (canonical, alias),
+            )
+
+    def delete_field_alias(self, canonical: str, alias: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM field_aliases WHERE canonical = ? AND alias = ?",
+                (canonical, alias),
+            )
+
+    def set_app_setting(self, key: str, value: dict[str, object]) -> None:
+        now = datetime.now().isoformat(timespec="seconds")
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO app_settings (key, value_json, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value_json = excluded.value_json,
+                    updated_at = excluded.updated_at
+                """,
+                (key, json.dumps(value, ensure_ascii=False), now),
+            )
+
+    def get_app_setting(self, key: str) -> dict[str, object]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT value_json FROM app_settings WHERE key = ?",
+                (key,),
+            ).fetchone()
+        return json.loads(row[0]) if row else {}
+
     @staticmethod
     def _row_to_record(row) -> TemplateRecord:
         return TemplateRecord(
@@ -255,4 +432,13 @@ class TemplateStore:
             output_paths=json.loads(row[4]),
             values=json.loads(row[5]),
             created_at=row[6],
+        )
+
+    @staticmethod
+    def _customer_row_to_record(row) -> CustomerRecord:
+        return CustomerRecord(
+            cccd=row[0],
+            fields=json.loads(row[1]),
+            created_at=row[2],
+            updated_at=row[3],
         )

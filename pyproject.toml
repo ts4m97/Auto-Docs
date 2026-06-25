@@ -13,6 +13,7 @@ dependencies = [
   "python-docx>=1.1",
   "openpyxl>=3.1",
   "pywin32>=306; platform_system == 'Windows'",
+  "pyodbc>=5.1",
   "PyMuPDF>=1.24",
   "Pillow>=10.0",
 ]
@@ -24,4 +25,3 @@ build = [
 
 [tool.pyinstaller]
 spec = "AutoDocs.spec"
-

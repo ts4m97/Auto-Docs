@@ -4,15 +4,18 @@ import os
 import sys
 import uuid
 import ctypes
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QAction, QIcon
+from PySide6.QtCore import QSize, Qt, QThread, Signal
+from PySide6.QtGui import QColor, QIcon
 from PySide6.QtPrintSupport import QPrinterInfo
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
+    QButtonGroup,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDoubleSpinBox,
@@ -29,7 +32,9 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QRadioButton,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QSplitter,
     QStackedWidget,
@@ -55,7 +60,8 @@ from autodocs.document_service import (
     with_system_values,
 )
 from autodocs.print_service import PrintCancelled, open_printer_preferences, print_files
-from autodocs.storage import ExportHistoryRecord, TemplateRecord, TemplateStore
+from autodocs.sql_import_service import SqlConnectionConfig, import_drivers_from_sql
+from autodocs.storage import CustomerRecord, ExportHistoryRecord, TemplateRecord, TemplateStore
 
 
 APP_NAME = "Auto Docs"
@@ -66,6 +72,44 @@ ROOT_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False
 DATA_DIR = ROOT_DIR / "data"
 EXPORT_DIR = ROOT_DIR / "exports"
 APP_ICON_PATH = RESOURCE_DIR / "assets" / "autodocs.ico"
+
+CUSTOMER_FIELD_ALIASES = {
+    "cccd": ["cccd", "so_cccd", "socccd", "cmnd", "so_cmnd", "socmnd", "cmt", "so_cmt", "socmt", "citizen_id", "id_number"],
+    "ten_khach_hang": [
+        "ten_khach_hang",
+        "tenkhachhang",
+        "ho_ten",
+        "hoten",
+        "ho_va_ten",
+        "hovaten",
+        "name",
+        "customer_name",
+        "client_name",
+        "khach_hang",
+    ],
+    "so_dien_thoai": ["so_dien_thoai", "sodienthoai", "dien_thoai", "phone", "mobile", "tel", "sdt"],
+    "email": ["email", "mail", "e_mail"],
+    "dia_chi": ["dia_chi", "diachi", "address", "add", "dc", "noi_o", "noi_ohientai"],
+    "ma_so_thue": ["ma_so_thue", "masothue", "mst", "tax_code", "tax_id"],
+    "ngay_cap_cccd": ["ngay_cap_cccd", "ngaycapcccd", "ngay_cap", "issue_date"],
+    "noi_cap_cccd": ["noi_cap_cccd", "noicapcccd", "noi_cap", "issue_place"],
+    "nguoi_dai_dien": ["nguoi_dai_dien", "nguoidaidien", "representative", "dai_dien"],
+    "ghi_chu": ["ghi_chu", "ghichu", "note", "notes"],
+    "ten_khoa_hoc": ["ten_khoa_hoc", "tenkhoahoc", "ten_khoa", "tenkhoa", "tenkh"],
+    "ma_khoa_hoc": ["ma_khoa_hoc", "makhoahoc", "ma_kh", "makh"],
+    "hang_dao_tao": ["hang_dao_tao", "hangdaotao", "hang_dt", "hangdt", "hang_gplx", "hanggplx"],
+}
+
+DEFAULT_CUSTOMER_FIELDS = [
+    "ten_khach_hang",
+    "so_dien_thoai",
+    "email",
+    "dia_chi",
+    "ma_so_thue",
+    "ngay_cap_cccd",
+    "noi_cap_cccd",
+    "ghi_chu",
+]
 
 
 class PrintFileList(QListWidget):
@@ -228,11 +272,396 @@ class AddTemplateDialog(QDialog):
         super().accept()
 
 
+def normalize_field_key(value: str) -> str:
+    text = unicodedata.normalize("NFKD", value)
+    text = "".join(char for char in text if not unicodedata.combining(char))
+    return "".join(char.casefold() for char in text if char.isalnum())
+
+
+def customer_alias_lookup(extra_aliases: dict[str, list[str]] | None = None) -> dict[str, str]:
+    lookup: dict[str, str] = {}
+    merged = {key: list(value) for key, value in CUSTOMER_FIELD_ALIASES.items()}
+    for canonical, aliases in (extra_aliases or {}).items():
+        merged.setdefault(canonical, [])
+        merged[canonical].extend(aliases)
+
+    for canonical, aliases in merged.items():
+        lookup[normalize_field_key(canonical)] = canonical
+        for alias in aliases:
+            lookup[normalize_field_key(alias)] = canonical
+    return lookup
+
+
+def resolve_customer_value(
+    placeholder: str,
+    customer: CustomerRecord,
+    extra_aliases: dict[str, list[str]] | None = None,
+) -> str | None:
+    fields = {"cccd": customer.cccd, **customer.fields}
+    normalized_fields = {normalize_field_key(key): str(value) for key, value in fields.items()}
+    placeholder_key = normalize_field_key(placeholder)
+    if placeholder_key in normalized_fields:
+        return normalized_fields[placeholder_key]
+
+    aliases = {key: list(value) for key, value in CUSTOMER_FIELD_ALIASES.items()}
+    for canonical, custom_aliases in (extra_aliases or {}).items():
+        aliases.setdefault(canonical, [])
+        aliases[canonical].extend(custom_aliases)
+
+    lookup = customer_alias_lookup(extra_aliases)
+    canonical = lookup.get(placeholder_key)
+    if not canonical:
+        return None
+
+    for alias in [canonical, *aliases.get(canonical, [])]:
+        value = normalized_fields.get(normalize_field_key(alias))
+        if value not in (None, ""):
+            return value
+    for field_key, value in normalized_fields.items():
+        if lookup.get(field_key) == canonical and value:
+            return value
+    return None
+
+
+class CustomerDialog(QDialog):
+    def __init__(self, customer: CustomerRecord | None = None, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("Thông tin khách hàng")
+        self.setMinimumWidth(720)
+        self.resize(760, 560)
+
+        self.cccd = QLineEdit()
+        self.cccd.setPlaceholderText("Số CCCD dùng làm mã khách hàng")
+        if customer:
+            self.cccd.setText(customer.cccd)
+            self.cccd.setReadOnly(True)
+
+        self.field_table = QTableWidget(0, 2)
+        self.field_table.setHorizontalHeaderLabels(["Tên cột", "Giá trị"])
+        self.field_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.field_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.field_table.verticalHeader().setVisible(False)
+        self.field_table.setAlternatingRowColors(True)
+
+        add_field = QPushButton("Thêm cột")
+        add_field.clicked.connect(lambda: self.add_field_row("", ""))
+        remove_field = QPushButton("Xóa cột đã chọn")
+        remove_field.setObjectName("dangerButton")
+        remove_field.clicked.connect(self.remove_selected_rows)
+
+        tools = QHBoxLayout()
+        tools.addWidget(add_field)
+        tools.addWidget(remove_field)
+        tools.addStretch()
+
+        form = QFormLayout()
+        form.addRow("CCCD", self.cccd)
+
+        cancel_button = QPushButton("Hủy")
+        cancel_button.clicked.connect(self.reject)
+        save_button = QPushButton("Lưu khách hàng")
+        save_button.setObjectName("primaryButton")
+        save_button.clicked.connect(self.accept)
+
+        footer = QHBoxLayout()
+        footer.addStretch()
+        footer.addWidget(cancel_button)
+        footer.addWidget(save_button)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(QLabel("Các cột thông tin"))
+        layout.addWidget(self.field_table, 1)
+        layout.addLayout(tools)
+        layout.addLayout(footer)
+
+        if customer:
+            for key, value in customer.fields.items():
+                if key != "cccd":
+                    self.add_field_row(key, value)
+        else:
+            for key in DEFAULT_CUSTOMER_FIELDS:
+                self.add_field_row(key, "")
+
+    def add_field_row(self, key: str, value: str) -> None:
+        row = self.field_table.rowCount()
+        self.field_table.insertRow(row)
+        self.field_table.setItem(row, 0, QTableWidgetItem(key))
+        self.field_table.setItem(row, 1, QTableWidgetItem(value))
+
+    def remove_selected_rows(self) -> None:
+        rows = sorted({item.row() for item in self.field_table.selectedItems()}, reverse=True)
+        for row in rows:
+            self.field_table.removeRow(row)
+
+    def fields(self) -> dict[str, str]:
+        fields: dict[str, str] = {}
+        for row in range(self.field_table.rowCount()):
+            key_item = self.field_table.item(row, 0)
+            value_item = self.field_table.item(row, 1)
+            key = key_item.text().strip() if key_item else ""
+            if not key:
+                continue
+            value = value_item.text().strip() if value_item else ""
+            fields[key] = value
+        return fields
+
+    def accept(self) -> None:
+        if not self.cccd.text().strip():
+            QMessageBox.warning(self, "Thiếu CCCD", "Vui lòng nhập số CCCD của khách hàng.")
+            return
+        super().accept()
+
+
+class FieldAliasDialog(QDialog):
+    def __init__(self, store: TemplateStore, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.store = store
+        self.setWindowTitle("Ánh xạ trường")
+        self.setMinimumWidth(640)
+        self.resize(680, 480)
+
+        self.canonical = QComboBox()
+        self.canonical.setEditable(True)
+        self.canonical.addItems(sorted(CUSTOMER_FIELD_ALIASES.keys()))
+
+        self.alias = QLineEdit()
+        self.alias.setPlaceholderText("Ví dụ: diachi, address, noi_o_hien_tai")
+
+        add_button = QPushButton("Thêm ánh xạ")
+        add_button.setObjectName("primaryButton")
+        add_button.clicked.connect(self.add_alias)
+        delete_button = QPushButton("Xóa ánh xạ đã chọn")
+        delete_button.setObjectName("dangerButton")
+        delete_button.clicked.connect(self.delete_selected_alias)
+
+        form = QFormLayout()
+        form.addRow("Trường chuẩn", self.canonical)
+        form.addRow("Alias", self.alias)
+
+        action_row = QHBoxLayout()
+        action_row.addWidget(add_button)
+        action_row.addWidget(delete_button)
+        action_row.addStretch()
+
+        self.alias_table = QTableWidget(0, 2)
+        self.alias_table.setHorizontalHeaderLabels(["Trường chuẩn", "Alias tự thêm"])
+        self.alias_table.verticalHeader().setVisible(False)
+        self.alias_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.alias_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.alias_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.alias_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.alias_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+
+        close_button = QPushButton("Đóng")
+        close_button.clicked.connect(self.accept)
+        footer = QHBoxLayout()
+        footer.addStretch()
+        footer.addWidget(close_button)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addLayout(action_row)
+        layout.addWidget(self.alias_table, 1)
+        layout.addLayout(footer)
+
+        self.refresh_aliases()
+
+    def refresh_aliases(self) -> None:
+        aliases = self.store.list_field_aliases()
+        rows = [(canonical, alias) for canonical, values in aliases.items() for alias in values]
+        self.alias_table.setRowCount(len(rows))
+        for row, (canonical, alias) in enumerate(rows):
+            self.alias_table.setItem(row, 0, QTableWidgetItem(canonical))
+            self.alias_table.setItem(row, 1, QTableWidgetItem(alias))
+
+    def add_alias(self) -> None:
+        try:
+            self.store.add_field_alias(self.canonical.currentText(), self.alias.text())
+        except Exception as exc:
+            QMessageBox.warning(self, "Không thêm được ánh xạ", str(exc))
+            return
+        self.alias.clear()
+        self.refresh_aliases()
+
+    def delete_selected_alias(self) -> None:
+        row = self.alias_table.currentRow()
+        if row < 0:
+            return
+        canonical_item = self.alias_table.item(row, 0)
+        alias_item = self.alias_table.item(row, 1)
+        if not canonical_item or not alias_item:
+            return
+        self.store.delete_field_alias(canonical_item.text(), alias_item.text())
+        self.refresh_aliases()
+
+
+class SqlImportDialog(QDialog):
+    SETTING_KEY = "sql_import_config"
+
+    def __init__(self, store: TemplateStore, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.store = store
+        self.setWindowTitle("Nhập khách hàng từ SQL Server")
+        self.setMinimumWidth(620)
+
+        config = self.store.get_app_setting(self.SETTING_KEY)
+
+        self.server = QLineEdit(str(config.get("server") or "192.168.1.109\\SQLEXPRESS"))
+        self.database = QLineEdit(str(config.get("database") or "GPLX_CDB_CSDT_v2"))
+        self.username = QLineEdit(str(config.get("username") or "sa"))
+        self.password = QLineEdit(str(config.get("password") or ""))
+        self.password.setEchoMode(QLineEdit.EchoMode.Password)
+
+        form = QFormLayout()
+        form.addRow("Địa chỉ máy chủ", self.server)
+        form.addRow("Tên CSDL", self.database)
+        form.addRow("Tài khoản", self.username)
+        form.addRow("Mật khẩu", self.password)
+
+        hint = QLabel("Nguồn dữ liệu: dbo.NguoiLX. Nếu tìm được khóa liên kết, app sẽ lấy thêm thông tin từ dbo.KhoaHoc.")
+        hint.setObjectName("muted")
+        hint.setWordWrap(True)
+
+        save_button = QPushButton("Lưu cấu hình")
+        save_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton))
+        save_button.clicked.connect(self.save_config)
+        import_button = QPushButton("Nhập khách hàng")
+        import_button.setObjectName("primaryButton")
+        import_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogApplyButton))
+        import_button.clicked.connect(self.import_customers)
+        close_button = QPushButton("Thoát")
+        close_button.clicked.connect(self.reject)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        buttons.addWidget(save_button)
+        buttons.addWidget(import_button)
+        buttons.addWidget(close_button)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(hint)
+        layout.addLayout(buttons)
+
+    def config(self) -> SqlConnectionConfig:
+        return SqlConnectionConfig(
+            server=self.server.text().strip(),
+            database=self.database.text().strip(),
+            username=self.username.text().strip(),
+            password=self.password.text(),
+        )
+
+    def save_config(self) -> None:
+        config = self.config()
+        if not self.validate_config(config):
+            return
+        self.store.set_app_setting(
+            self.SETTING_KEY,
+            {
+                "server": config.server,
+                "database": config.database,
+                "username": config.username,
+                "password": config.password,
+            },
+        )
+        QMessageBox.information(self, "Đã lưu", "Cấu hình SQL đã được lưu trên máy này.")
+
+    def import_customers(self) -> None:
+        config = self.config()
+        if not self.validate_config(config):
+            return
+        self.store.set_app_setting(
+            self.SETTING_KEY,
+            {
+                "server": config.server,
+                "database": config.database,
+                "username": config.username,
+                "password": config.password,
+            },
+        )
+
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            result = import_drivers_from_sql(config, self.store)
+        except Exception as exc:
+            QMessageBox.critical(self, "Không nhập được dữ liệu SQL", str(exc))
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        QMessageBox.information(
+            self,
+            "Đã nhập khách hàng",
+            (
+                f"Đã nhập/cập nhật {result.imported} khách hàng.\n"
+                f"Bỏ qua {result.skipped} dòng thiếu CCCD.\n"
+                f"Cột CCCD: {result.cccd_column}\n"
+                f"Khóa học: {result.course_join}"
+            ),
+        )
+        self.accept()
+
+    def validate_config(self, config: SqlConnectionConfig) -> bool:
+        if not config.server or not config.database or not config.username:
+            QMessageBox.warning(self, "Thiếu cấu hình", "Vui lòng nhập đủ máy chủ, tên CSDL và tài khoản.")
+            return False
+        return True
+
+
+class CustomerExportDialog(QDialog):
+    def __init__(self, count: int, default_pattern: str, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("Xuất khách hàng đã chọn")
+        self.setMinimumWidth(520)
+
+        self.pattern = QLineEdit(default_pattern)
+        self.pattern.setPlaceholderText("Quy cách tên file")
+
+        self.docx_radio = QRadioButton("DOCX")
+        self.pdf_radio = QRadioButton("PDF")
+        self.docx_radio.setChecked(True)
+
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(self.docx_radio)
+        mode_row.addWidget(self.pdf_radio)
+        mode_row.addStretch()
+
+        summary = QLabel(f"Sẽ xuất {count} khách hàng đang chọn bằng mẫu Word hiện tại.")
+        summary.setObjectName("muted")
+        summary.setWordWrap(True)
+
+        form = QFormLayout()
+        form.addRow("Tên file", self.pattern)
+        form.addRow("Định dạng", mode_row)
+
+        cancel_button = QPushButton("Hủy")
+        cancel_button.clicked.connect(self.reject)
+        export_button = QPushButton("Xuất")
+        export_button.setObjectName("primaryButton")
+        export_button.clicked.connect(self.accept)
+
+        footer = QHBoxLayout()
+        footer.addStretch()
+        footer.addWidget(cancel_button)
+        footer.addWidget(export_button)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(summary)
+        layout.addLayout(form)
+        layout.addLayout(footer)
+
+    def export_mode(self) -> str:
+        return "pdf" if self.pdf_radio.isChecked() else "docx"
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.store = TemplateStore(DATA_DIR)
         self.templates: list[TemplateRecord] = []
+        self.customers: list[CustomerRecord] = []
+        self.customer_aliases: dict[str, list[str]] = {}
         self.current_template: TemplateRecord | None = None
         self.manual_inputs: dict[str, QLineEdit] = {}
         self.excel_rows: list[dict[str, object]] = []
@@ -244,17 +673,54 @@ class MainWindow(QMainWindow):
 
         self.build_ui()
         self.apply_style()
+        self.refresh_customers()
         self.refresh_templates()
 
     def build_ui(self) -> None:
         toolbar = self.addToolBar("Công cụ")
+        toolbar.setObjectName("topToolbar")
         toolbar.setMovable(False)
-        add_action = QAction(self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon), "Thêm mẫu", self)
-        add_action.triggered.connect(self.add_template)
-        toolbar.addAction(add_action)
-        open_action = QAction(self.style().standardIcon(QStyle.StandardPixmap.SP_DirOpenIcon), "Mở thư mục xuất", self)
-        open_action.triggered.connect(self.open_output_dir)
-        toolbar.addAction(open_action)
+        toolbar.setIconSize(QSize(18, 18))
+
+        brand = QLabel("Auto Docs")
+        brand.setObjectName("toolbarBrand")
+        toolbar.addWidget(brand)
+
+        nav_shell = QFrame()
+        nav_shell.setObjectName("toolbarNav")
+        nav_layout = QHBoxLayout(nav_shell)
+        nav_layout.setContentsMargins(4, 3, 4, 3)
+        nav_layout.setSpacing(2)
+        self.nav_group = QButtonGroup(self)
+        self.nav_group.setExclusive(True)
+        self.nav_buttons: list[QPushButton] = []
+        for index, label in enumerate(("Mẫu", "Khách hàng", "Excel", "In", "Lịch sử")):
+            button = QPushButton(label)
+            button.setObjectName("navButton")
+            button.setCheckable(True)
+            button.setMinimumHeight(34)
+            button.clicked.connect(lambda _checked=False, tab_index=index: self.on_toolbar_tab_changed(tab_index))
+            self.nav_group.addButton(button, index)
+            self.nav_buttons.append(button)
+            nav_layout.addWidget(button)
+        self.nav_buttons[0].setChecked(True)
+        toolbar.addWidget(nav_shell)
+
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        toolbar.addWidget(spacer)
+
+        add_button = QPushButton("Thêm mẫu")
+        add_button.setObjectName("toolbarActionButton")
+        add_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon))
+        add_button.clicked.connect(self.add_template)
+        toolbar.addWidget(add_button)
+
+        open_button = QPushButton("Mở thư mục xuất")
+        open_button.setObjectName("toolbarActionButton")
+        open_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DirOpenIcon))
+        open_button.clicked.connect(self.open_output_dir)
+        toolbar.addWidget(open_button)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setChildrenCollapsible(False)
@@ -262,6 +728,27 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self.build_workspace())
         splitter.setSizes([300, 880])
         self.setCentralWidget(splitter)
+
+    def on_toolbar_tab_changed(self, index: int) -> None:
+        if not hasattr(self, "tabs"):
+            return
+        self.update_template_context_visibility(index)
+        if index == 0:
+            self.tabs.setCurrentIndex(0)
+            self.stack.setCurrentWidget(self.detail_page if self.current_template else self.empty_page)
+            return
+        self.stack.setCurrentWidget(self.detail_page)
+        self.tabs.setCurrentIndex(index)
+
+    def sync_toolbar_tab(self, index: int) -> None:
+        self.update_template_context_visibility(index)
+        if not hasattr(self, "nav_buttons") or index < 0 or index >= len(self.nav_buttons):
+            return
+        self.nav_buttons[index].setChecked(True)
+
+    def update_template_context_visibility(self, tab_index: int) -> None:
+        if hasattr(self, "template_context_panel"):
+            self.template_context_panel.setVisible(tab_index not in (1, 3))
 
     def app_icon(self) -> QIcon:
         if APP_ICON_PATH.exists():
@@ -275,9 +762,9 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(10)
 
-        title = QLabel("Auto Docs")
+        title = QLabel("Thư viện mẫu")
         title.setObjectName("appTitle")
-        subtitle = QLabel("Tạo tài liệu từ mẫu Word offline")
+        subtitle = QLabel("Chọn mẫu Word để tạo tài liệu")
         subtitle.setObjectName("muted")
 
         self.search_box = QLineEdit()
@@ -361,8 +848,13 @@ class MainWindow(QMainWindow):
         output_row.addWidget(open_output)
 
         header.addLayout(header_text, 1)
-        layout.addLayout(header)
-        layout.addLayout(output_row)
+
+        self.template_context_panel = QWidget()
+        context_layout = QVBoxLayout(self.template_context_panel)
+        context_layout.setContentsMargins(0, 0, 0, 0)
+        context_layout.setSpacing(12)
+        context_layout.addLayout(header)
+        context_layout.addLayout(output_row)
 
         placeholder_frame = QFrame()
         placeholder_frame.setObjectName("panel")
@@ -378,12 +870,18 @@ class MainWindow(QMainWindow):
         self.placeholder_table.setMaximumHeight(155)
         placeholder_layout.addWidget(placeholder_title)
         placeholder_layout.addWidget(self.placeholder_table)
+        context_layout.addWidget(placeholder_frame)
 
         self.tabs = QTabWidget()
         self.tabs.addTab(
             self.build_manual_tab(),
             self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogContentsView),
             "Nhập thủ công",
+        )
+        self.tabs.addTab(
+            self.build_customer_tab(),
+            self.style().standardIcon(QStyle.StandardPixmap.SP_DirHomeIcon),
+            "Khách hàng",
         )
         self.tabs.addTab(
             self.build_excel_tab(),
@@ -400,8 +898,10 @@ class MainWindow(QMainWindow):
             self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogInfoView),
             "Lịch sử",
         )
+        self.tabs.tabBar().hide()
+        self.tabs.currentChanged.connect(self.sync_toolbar_tab)
 
-        layout.addWidget(placeholder_frame)
+        layout.addWidget(self.template_context_panel)
         layout.addWidget(self.tabs, 1)
         return page
 
@@ -416,6 +916,20 @@ class MainWindow(QMainWindow):
         form_title = QLabel("Thông tin cần điền")
         form_title.setObjectName("sectionTitle")
 
+        customer_row = QHBoxLayout()
+        self.manual_customer_combo = QComboBox()
+        self.manual_customer_combo.setMinimumWidth(260)
+        fill_customer_button = QPushButton("Điền từ khách hàng")
+        fill_customer_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogApplyButton))
+        fill_customer_button.clicked.connect(self.fill_manual_from_selected_customer)
+        manage_customer_button = QPushButton("Quản lý")
+        manage_customer_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DirHomeIcon))
+        manage_customer_button.clicked.connect(lambda: self.tabs.setCurrentWidget(self.customer_tab))
+        customer_row.addWidget(QLabel("Khách hàng"))
+        customer_row.addWidget(self.manual_customer_combo, 1)
+        customer_row.addWidget(fill_customer_button)
+        customer_row.addWidget(manage_customer_button)
+
         self.manual_form_widget = QWidget()
         self.manual_form = QFormLayout(self.manual_form_widget)
         self.manual_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
@@ -426,6 +940,7 @@ class MainWindow(QMainWindow):
         scroll.setWidget(self.manual_form_widget)
 
         form_layout.addWidget(form_title)
+        form_layout.addLayout(customer_row)
         form_layout.addWidget(scroll, 1)
 
         export_panel = QFrame()
@@ -458,6 +973,100 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(form_panel, 1)
         layout.addWidget(export_panel)
+        return page
+
+    def build_customer_tab(self) -> QWidget:
+        page = QWidget()
+        self.customer_tab = page
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 14, 0, 0)
+        layout.setSpacing(10)
+
+        top = QFrame()
+        top.setObjectName("panel")
+        top_layout = QVBoxLayout(top)
+        title = QLabel("Danh bạ khách hàng")
+        title.setObjectName("sectionTitle")
+
+        self.customer_search = QLineEdit()
+        self.customer_search.setPlaceholderText("Tìm theo CCCD, tên, điện thoại, email...")
+        self.customer_search.textChanged.connect(self.refresh_customers)
+
+        actions = QHBoxLayout()
+        actions.setSpacing(8)
+        add_button = QPushButton("Thêm khách hàng")
+        add_button.setObjectName("customerPrimaryAction")
+        add_button.clicked.connect(self.add_customer)
+        sql_import_button = QPushButton("Nhập từ SQL")
+        sql_import_button.setObjectName("customerAction")
+        sql_import_button.clicked.connect(self.import_customers_from_sql)
+        edit_button = QPushButton("Sửa")
+        edit_button.setObjectName("customerAction")
+        edit_button.clicked.connect(self.edit_selected_customer)
+        delete_button = QPushButton("Xóa")
+        delete_button.setObjectName("customerDangerAction")
+        delete_button.clicked.connect(self.delete_selected_customer)
+        select_all_button = QPushButton("Chọn tất cả")
+        select_all_button.setObjectName("customerAction")
+        select_all_button.clicked.connect(self.check_all_visible_customers)
+        clear_selection_button = QPushButton("Bỏ chọn")
+        clear_selection_button.setObjectName("customerAction")
+        clear_selection_button.clicked.connect(self.clear_checked_customers)
+        fill_button = QPushButton("Điền vào mẫu")
+        fill_button.setObjectName("customerAction")
+        fill_button.clicked.connect(self.fill_manual_from_customer_table)
+        export_selected_button = QPushButton("Xuất KH đã chọn")
+        export_selected_button.setObjectName("customerPrimaryAction")
+        export_selected_button.clicked.connect(self.export_selected_customers)
+        alias_button = QPushButton("Ánh xạ")
+        alias_button.setObjectName("customerAction")
+        alias_button.clicked.connect(self.manage_field_aliases)
+
+        actions.addWidget(add_button)
+        actions.addWidget(sql_import_button)
+        actions.addWidget(edit_button)
+        actions.addWidget(delete_button)
+        actions.addWidget(select_all_button)
+        actions.addWidget(clear_selection_button)
+        actions.addWidget(fill_button)
+        actions.addWidget(export_selected_button)
+        actions.addWidget(alias_button)
+        actions.addStretch()
+
+        top_layout.addWidget(title)
+        top_layout.addWidget(self.customer_search)
+        top_layout.addLayout(actions)
+
+        self.customer_summary = QLabel("Chưa có khách hàng.")
+        self.customer_summary.setObjectName("muted")
+        self.customer_selection_summary = QLabel("Chưa chọn khách hàng nào.")
+        self.customer_selection_summary.setObjectName("selectionSummary")
+
+        self.customer_table = QTableWidget(0, 6)
+        self.customer_table.setObjectName("customerTable")
+        self.customer_table.setHorizontalHeaderLabels(["Chọn", "CCCD", "Tên khách hàng", "Điện thoại", "Email", "Số cột"])
+        self.customer_table.verticalHeader().setVisible(False)
+        self.customer_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.customer_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.customer_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.customer_table.setAlternatingRowColors(True)
+        self.customer_table.setWordWrap(False)
+        self.customer_table.setShowGrid(False)
+        self.customer_table.verticalHeader().setDefaultSectionSize(42)
+        self.customer_table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.customer_table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.customer_table.doubleClicked.connect(self.edit_selected_customer)
+        self.customer_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.customer_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.customer_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.customer_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.customer_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self.customer_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+
+        layout.addWidget(top)
+        layout.addWidget(self.customer_summary)
+        layout.addWidget(self.customer_selection_summary)
+        layout.addWidget(self.customer_table, 1)
         return page
 
     def build_excel_tab(self) -> QWidget:
@@ -699,6 +1308,341 @@ class MainWindow(QMainWindow):
             self.template_list.setCurrentRow(0)
         else:
             self.stack.setCurrentWidget(self.empty_page)
+
+    def refresh_customers(self, *_args) -> None:
+        query = self.customer_search.text() if hasattr(self, "customer_search") else ""
+        self.customer_aliases = self.store.list_field_aliases()
+        self.customers = self.store.list_customers(query)
+        self.populate_customer_combo()
+        self.populate_customer_table()
+
+    def populate_customer_combo(self) -> None:
+        if not hasattr(self, "manual_customer_combo"):
+            return
+        current_cccd = self.manual_customer_combo.currentData()
+        self.manual_customer_combo.blockSignals(True)
+        self.manual_customer_combo.clear()
+        self.manual_customer_combo.addItem("Chọn khách hàng...", "")
+        selected_index = 0
+        for index, customer in enumerate(self.store.list_customers(), start=1):
+            label = f"{customer.display_name} ({self.mask_cccd(customer.cccd)})"
+            self.manual_customer_combo.addItem(label, customer.cccd)
+            if customer.cccd == current_cccd:
+                selected_index = index
+        self.manual_customer_combo.setCurrentIndex(selected_index)
+        self.manual_customer_combo.blockSignals(False)
+
+    def populate_customer_table(self) -> None:
+        if not hasattr(self, "customer_table"):
+            return
+        checked = set(self.checked_customer_cccds())
+        self.customer_table.blockSignals(True)
+        self.customer_table.setRowCount(len(self.customers))
+        for row, customer in enumerate(self.customers):
+            check_item = QTableWidgetItem()
+            check_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            check_item.setData(Qt.ItemDataRole.UserRole, customer.cccd)
+            self.customer_table.setItem(row, 0, check_item)
+            self.customer_table.setCellWidget(row, 0, self.create_customer_check_cell(customer.cccd, customer.cccd in checked))
+
+            values = [
+                customer.cccd,
+                customer.display_name,
+                resolve_customer_value("so_dien_thoai", customer, self.customer_aliases) or "",
+                resolve_customer_value("email", customer, self.customer_aliases) or "",
+                str(len(customer.fields)),
+            ]
+            for column, value in enumerate(values, start=1):
+                item = QTableWidgetItem(value)
+                item.setData(Qt.ItemDataRole.UserRole, customer.cccd)
+                item.setToolTip(self.customer_tooltip(customer))
+                self.customer_table.setItem(row, column, item)
+            self.set_customer_row_checked(row, customer.cccd in checked)
+            self.customer_table.setRowHeight(row, 42)
+        self.customer_table.blockSignals(False)
+        self.customer_table.setColumnWidth(0, 58)
+        if hasattr(self, "customer_summary"):
+            self.customer_summary.setText(f"{len(self.customers)} khách hàng trong danh sách.")
+        self.update_customer_selection_summary()
+
+    def create_customer_check_cell(self, cccd: str, checked: bool) -> QWidget:
+        wrapper = QWidget()
+        wrapper.setObjectName("checkCell")
+        layout = QHBoxLayout(wrapper)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        checkbox = QCheckBox()
+        checkbox.setObjectName("customerCheckBox")
+        checkbox.setChecked(checked)
+        checkbox.setProperty("cccd", cccd)
+        checkbox.stateChanged.connect(self.on_customer_check_changed)
+        layout.addWidget(checkbox)
+        return wrapper
+
+    def on_customer_check_changed(self, *_args) -> None:
+        checkbox = self.sender()
+        if not isinstance(checkbox, QCheckBox):
+            return
+        row = self.customer_row_for_cccd(str(checkbox.property("cccd") or ""))
+        if row >= 0:
+            self.set_customer_row_checked(row, checkbox.isChecked())
+        self.update_customer_selection_summary()
+
+    def customer_row_for_cccd(self, cccd: str) -> int:
+        for row in range(self.customer_table.rowCount()):
+            item = self.customer_table.item(row, 0)
+            if item and item.data(Qt.ItemDataRole.UserRole) == cccd:
+                return row
+        return -1
+
+    def set_customer_row_checked(self, row: int, checked: bool) -> None:
+        color = QColor("#EEF4FF") if checked else QColor("#FFFFFF")
+        alternate = QColor("#F8FAFC") if row % 2 else QColor("#FFFFFF")
+        background = color if checked else alternate
+        for column in range(1, self.customer_table.columnCount()):
+            item = self.customer_table.item(row, column)
+            if item:
+                item.setBackground(background)
+
+    def mask_cccd(self, cccd: str) -> str:
+        if len(cccd) <= 6:
+            return cccd
+        return f"{cccd[:4]}...{cccd[-3:]}"
+
+    def customer_tooltip(self, customer: CustomerRecord) -> str:
+        fields = [f"CCCD: {customer.cccd}"]
+        for key, value in sorted(customer.fields.items(), key=lambda item: item[0].casefold()):
+            if key != "cccd" and value:
+                fields.append(f"{key}: {value}")
+        return "\n".join(fields)
+
+    def selected_customer_from_combo(self) -> CustomerRecord | None:
+        if not hasattr(self, "manual_customer_combo"):
+            return None
+        cccd = self.manual_customer_combo.currentData()
+        return self.store.get_customer(cccd) if cccd else None
+
+    def selected_customer_from_table(self) -> CustomerRecord | None:
+        if not hasattr(self, "customer_table"):
+            return None
+        row = self.customer_table.currentRow()
+        if row < 0:
+            return None
+        item = self.customer_table.item(row, 1) or self.customer_table.item(row, 0)
+        if not item:
+            return None
+        return self.store.get_customer(item.data(Qt.ItemDataRole.UserRole))
+
+    def selected_customers_from_table(self) -> list[CustomerRecord]:
+        cccds = self.checked_customer_cccds()
+        customers = [self.store.get_customer(cccd) for cccd in cccds]
+        return [customer for customer in customers if customer]
+
+    def checked_customer_cccds(self) -> list[str]:
+        if not hasattr(self, "customer_table"):
+            return []
+        cccds: list[str] = []
+        for row in range(self.customer_table.rowCount()):
+            item = self.customer_table.item(row, 0)
+            checkbox = self.customer_checkbox_at(row)
+            if not item or not checkbox:
+                continue
+            cccd = item.data(Qt.ItemDataRole.UserRole)
+            if not cccd or not checkbox.isChecked():
+                continue
+            cccds.append(cccd)
+        return cccds
+
+    def customer_checkbox_at(self, row: int) -> QCheckBox | None:
+        widget = self.customer_table.cellWidget(row, 0)
+        return widget.findChild(QCheckBox) if widget else None
+
+    def update_customer_selection_summary(self) -> None:
+        if not hasattr(self, "customer_selection_summary"):
+            return
+        count = len(self.checked_customer_cccds())
+        total = self.customer_table.rowCount() if hasattr(self, "customer_table") else 0
+        if count:
+            self.customer_selection_summary.setText(f"Đã chọn {count}/{total} khách hàng để xuất.")
+        else:
+            self.customer_selection_summary.setText("Tick vào cột Chọn để xuất một hoặc nhiều khách hàng.")
+
+    def check_all_visible_customers(self) -> None:
+        if not hasattr(self, "customer_table"):
+            return
+        self.customer_table.blockSignals(True)
+        for row in range(self.customer_table.rowCount()):
+            checkbox = self.customer_checkbox_at(row)
+            if checkbox:
+                checkbox.blockSignals(True)
+                checkbox.setChecked(True)
+                checkbox.blockSignals(False)
+                self.set_customer_row_checked(row, True)
+        self.customer_table.blockSignals(False)
+        self.update_customer_selection_summary()
+
+    def clear_checked_customers(self) -> None:
+        if not hasattr(self, "customer_table"):
+            return
+        self.customer_table.blockSignals(True)
+        for row in range(self.customer_table.rowCount()):
+            checkbox = self.customer_checkbox_at(row)
+            if checkbox:
+                checkbox.blockSignals(True)
+                checkbox.setChecked(False)
+                checkbox.blockSignals(False)
+                self.set_customer_row_checked(row, False)
+        self.customer_table.blockSignals(False)
+        self.update_customer_selection_summary()
+
+    def add_customer(self) -> None:
+        dialog = CustomerDialog(parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        cccd = dialog.cccd.text().strip()
+        if self.store.get_customer(cccd):
+            QMessageBox.warning(self, "CCCD đã tồn tại", "Khách hàng với số CCCD này đã có trong danh bạ.")
+            return
+        try:
+            self.store.upsert_customer(cccd, dialog.fields())
+        except Exception as exc:
+            QMessageBox.critical(self, "Không lưu được khách hàng", str(exc))
+            return
+        self.refresh_customers()
+
+    def import_customers_from_sql(self) -> None:
+        dialog = SqlImportDialog(self.store, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.refresh_customers()
+
+    def edit_selected_customer(self, *_args) -> None:
+        customer = self.selected_customer_from_table()
+        if not customer:
+            QMessageBox.warning(self, "Chưa chọn khách hàng", "Vui lòng chọn một khách hàng để sửa.")
+            return
+        dialog = CustomerDialog(customer, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            self.store.upsert_customer(customer.cccd, dialog.fields())
+        except Exception as exc:
+            QMessageBox.critical(self, "Không lưu được khách hàng", str(exc))
+            return
+        self.refresh_customers()
+
+    def delete_selected_customer(self) -> None:
+        customer = self.selected_customer_from_table()
+        if not customer:
+            QMessageBox.warning(self, "Chưa chọn khách hàng", "Vui lòng chọn một khách hàng để xóa.")
+            return
+        answer = QMessageBox.question(
+            self,
+            "Xóa khách hàng",
+            f"Xóa khách hàng '{customer.display_name}' khỏi danh bạ?",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.store.delete_customer(customer.cccd)
+        self.refresh_customers()
+
+    def manage_field_aliases(self) -> None:
+        dialog = FieldAliasDialog(self.store, self)
+        dialog.exec()
+        self.refresh_customers()
+
+    def fill_manual_from_selected_customer(self) -> None:
+        customer = self.selected_customer_from_combo()
+        if not customer:
+            QMessageBox.warning(self, "Chưa chọn khách hàng", "Vui lòng chọn một khách hàng trong danh sách.")
+            return
+        self.apply_customer_to_manual_form(customer)
+
+    def fill_manual_from_customer_table(self) -> None:
+        customer = self.selected_customer_from_table()
+        if not customer:
+            QMessageBox.warning(self, "Chưa chọn khách hàng", "Vui lòng chọn một khách hàng trong danh sách.")
+            return
+        if hasattr(self, "manual_customer_combo"):
+            index = self.manual_customer_combo.findData(customer.cccd)
+            if index >= 0:
+                self.manual_customer_combo.setCurrentIndex(index)
+        self.apply_customer_to_manual_form(customer)
+        self.tabs.setCurrentWidget(self.tabs.widget(0))
+
+    def export_selected_customers(self) -> None:
+        if not self.current_template:
+            QMessageBox.warning(self, "Chưa chọn mẫu", "Vui lòng chọn mẫu Word trước khi xuất khách hàng.")
+            return
+        customers = self.selected_customers_from_table()
+        if not customers:
+            QMessageBox.warning(self, "Chưa chọn khách hàng", "Vui lòng chọn một hoặc nhiều khách hàng trong danh sách.")
+            return
+
+        default_pattern = self.suggest_customer_export_pattern(self.current_template)
+        dialog = CustomerExportDialog(len(customers), default_pattern, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        pattern = dialog.pattern.text().strip() or default_pattern
+        mode = dialog.export_mode()
+        try:
+            for index, customer in enumerate(customers, start=1):
+                values = self.customer_values_for_template(customer, self.current_template, index)
+                self.export_one(self.current_template, values, pattern, mode, index=index)
+        except Exception as exc:
+            QMessageBox.critical(self, "Xuất khách hàng bị lỗi", str(exc))
+            return
+
+        self.refresh_history()
+        self.show_export_done(
+            "Đã xuất xong",
+            f"Đã tạo {len(customers)} tài liệu từ khách hàng đã chọn.",
+            self.current_output_dir(),
+        )
+
+    def suggest_customer_export_pattern(self, record: TemplateRecord) -> str:
+        editable = self.editable_placeholders(record)
+        preferred = [
+            item
+            for item in ("ten_khach_hang", "cccd", "so_cmt", "so_cccd", "ten_khoa_hoc", "ma_khoa_hoc")
+            if item in editable
+        ]
+        selected = preferred[:2] or editable[:2]
+        if selected:
+            return " - ".join(f"[[{item}]]" for item in selected)
+        return f"{record.name}_[[auto_number]]"
+
+    def customer_values_for_template(
+        self,
+        customer: CustomerRecord,
+        record: TemplateRecord,
+        index: int,
+    ) -> dict[str, object]:
+        values: dict[str, object] = {}
+        for placeholder in self.editable_placeholders(record):
+            values[placeholder] = resolve_customer_value(placeholder, customer, self.customer_aliases) or ""
+        return with_system_values(values, auto_number=index)
+
+    def apply_customer_to_manual_form(self, customer: CustomerRecord) -> None:
+        if not self.manual_inputs:
+            QMessageBox.warning(self, "Chưa có mẫu", "Vui lòng chọn mẫu Word trước khi điền khách hàng.")
+            return
+        filled = 0
+        missing: list[str] = []
+        for placeholder, edit in self.manual_inputs.items():
+            value = resolve_customer_value(placeholder, customer, self.customer_aliases)
+            if value not in (None, ""):
+                edit.setText(value)
+                filled += 1
+            else:
+                missing.append(placeholder)
+        if filled:
+            message = f"Đã điền {filled} trường từ khách hàng."
+            if missing:
+                message += f"\n{len(missing)} trường chưa có dữ liệu hoặc chưa ánh xạ."
+            QMessageBox.information(self, "Đã điền dữ liệu", message)
+        else:
+            QMessageBox.warning(self, "Chưa khớp trường", "Không tìm thấy trường nào khớp với khách hàng này.")
 
     def populate_template_list(self) -> None:
         query = self.search_box.text().strip().casefold() if hasattr(self, "search_box") else ""
@@ -1286,19 +2230,58 @@ class MainWindow(QMainWindow):
                 font-size: 10pt;
             }
             QToolBar {
-                background: #FFFFFF;
+                background: #F8FAFC;
                 border: 0;
-                border-bottom: 1px solid #E3E7EF;
-                padding: 5px;
-                spacing: 8px;
+                border-bottom: 1px solid #DDE3EA;
+                padding: 9px 12px;
+                spacing: 10px;
+            }
+            #toolbarBrand {
+                color: #111827;
+                font-size: 14pt;
+                font-weight: 800;
+                padding: 0 16px 0 2px;
+            }
+            QFrame#toolbarNav {
+                background: #FFFFFF;
+                border: 1px solid #D7DEE8;
+                border-radius: 9px;
+            }
+            QPushButton#navButton {
+                background: transparent;
+                color: #4B5563;
+                border: 0;
+                border-radius: 6px;
+                padding: 7px 15px;
+                font-weight: 700;
+            }
+            QPushButton#navButton:hover {
+                background: #F1F5F9;
+                color: #111827;
+            }
+            QPushButton#navButton:checked {
+                background: #172033;
+                color: #FFFFFF;
+            }
+            QPushButton#toolbarActionButton {
+                background: #FFFFFF;
+                border: 1px solid #CBD5E1;
+                border-radius: 7px;
+                padding: 7px 12px;
+                color: #172033;
+                font-weight: 700;
+            }
+            QPushButton#toolbarActionButton:hover {
+                background: #F1F5F9;
+                border-color: #94A3B8;
             }
             #sidebar {
                 background: #FFFFFF;
                 border-right: 1px solid #E3E7EF;
             }
             #appTitle {
-                color: #102A43;
-                font-size: 21pt;
+                color: #111827;
+                font-size: 15pt;
                 font-weight: 700;
             }
             #pageTitle {
@@ -1318,6 +2301,14 @@ class MainWindow(QMainWindow):
             }
             #muted {
                 color: #667085;
+            }
+            #selectionSummary {
+                color: #334155;
+                background: #EEF2F7;
+                border: 1px solid #D8DEE9;
+                border-radius: 7px;
+                padding: 7px 10px;
+                font-weight: 600;
             }
             QLineEdit {
                 background: #FFFFFF;
@@ -1353,6 +2344,41 @@ class MainWindow(QMainWindow):
                 background: #FFF1F2;
                 border-color: #FDA4AF;
                 color: #BE123C;
+            }
+            QPushButton#customerAction,
+            QPushButton#customerDangerAction,
+            QPushButton#customerPrimaryAction {
+                min-height: 28px;
+                padding: 6px 12px;
+                border-radius: 7px;
+                font-weight: 650;
+            }
+            QPushButton#customerAction {
+                background: #FFFFFF;
+                border: 1px solid #D5DCE7;
+                color: #1F2937;
+            }
+            QPushButton#customerAction:hover {
+                background: #F8FAFC;
+                border-color: #AAB7C8;
+            }
+            QPushButton#customerPrimaryAction {
+                background: #1F5FE0;
+                border: 1px solid #1F5FE0;
+                color: #FFFFFF;
+            }
+            QPushButton#customerPrimaryAction:hover {
+                background: #174FC0;
+                border-color: #174FC0;
+            }
+            QPushButton#customerDangerAction {
+                background: #FFFFFF;
+                border: 1px solid #F1C8D0;
+                color: #A31535;
+            }
+            QPushButton#customerDangerAction:hover {
+                background: #FFF5F6;
+                border-color: #E89AAA;
             }
             #panel {
                 background: #FFFFFF;
@@ -1396,6 +2422,41 @@ class MainWindow(QMainWindow):
                 border-radius: 7px;
                 gridline-color: #E3E7EF;
             }
+            QTableWidget#customerTable {
+                background: #FFFFFF;
+                alternate-background-color: #F8FAFC;
+                border: 1px solid #DDE5EF;
+                border-radius: 8px;
+                selection-background-color: #EAF1FF;
+                selection-color: #0F172A;
+                outline: 0;
+            }
+            QTableWidget#customerTable::item {
+                border-bottom: 1px solid #E8EDF4;
+                padding: 8px 6px;
+            }
+            QTableWidget#customerTable::item:selected {
+                background: #EAF1FF;
+                color: #0F172A;
+            }
+            QFrame#checkCell {
+                background: transparent;
+            }
+            QCheckBox#customerCheckBox::indicator {
+                width: 18px;
+                height: 18px;
+                border-radius: 5px;
+                border: 1px solid #AAB7C8;
+                background: #FFFFFF;
+            }
+            QCheckBox#customerCheckBox::indicator:hover {
+                border-color: #1F5FE0;
+            }
+            QCheckBox#customerCheckBox::indicator:checked {
+                background: #1F5FE0;
+                border-color: #1F5FE0;
+                image: none;
+            }
             QHeaderView::section {
                 background: #EEF2F7;
                 color: #344054;
@@ -1403,6 +2464,14 @@ class MainWindow(QMainWindow):
                 border-right: 1px solid #D8DEE9;
                 padding: 7px;
                 font-weight: 700;
+            }
+            QTableWidget#customerTable QHeaderView::section {
+                background: #F1F5F9;
+                color: #1F2937;
+                border: 0;
+                border-bottom: 1px solid #DDE5EF;
+                padding: 10px 8px;
+                font-weight: 750;
             }
             QTabWidget::pane {
                 border: 0;
